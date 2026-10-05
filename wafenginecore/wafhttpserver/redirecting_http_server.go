@@ -52,10 +52,12 @@ func (l *redirectingListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 
-	return &redirectingConn{
+	// 指纹采集包在最外层：先窥探 ClientHello 计算 JA3+ALPN 并回放字节，
+	// 重定向逻辑随后照常读到同一批首字节（明文 HTTP 前缀检测不受影响）。
+	return newFingerprintConn(&redirectingConn{
 		Conn:      conn,
 		extConfig: l.extConfig,
-	}, nil
+	}), nil
 }
 
 type redirectingConn struct {
