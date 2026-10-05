@@ -28,7 +28,9 @@ func (waf *WafEngine) CheckCC(r *http.Request, weblogbean *innerbean.WebLog, for
 	// 紧急模式排在所有 CC 规则之前：它是站点级总闸，「先挑战再说」，
 	// 不看阈值也不看规则命中。这里只落标记不返回拦截，挑战由后面的验证码闸门发起。
 	if waf.isEmergencyOn(hostTarget, globalHostSafe) {
-		waf.applyEmergencyCaptcha(r, weblogbean, hostTarget)
+		if err := waf.applyEmergencyCaptcha(r, weblogbean, hostTarget); err != nil {
+			return detection.Result{IsBlock: true, Title: "CC紧急模式", Content: "验证码服务暂不可用"}
+		}
 	}
 
 	// 多规则优先：配置了多规则的站点走规则集，未配置的回退到旧的单条配置

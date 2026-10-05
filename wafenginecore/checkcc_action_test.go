@@ -5,16 +5,15 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"SamWaf/cache"
-	"SamWaf/enums"
 	"SamWaf/global"
 
 	"SamWaf/innerbean"
 	"SamWaf/model"
 	"SamWaf/model/wafenginmodel"
 	"SamWaf/wafenginecore/ccrule"
+	"SamWaf/wafenginecore/wafcaptcha"
 )
 
 func newActionRule(action string) *ccrule.CompiledRule {
@@ -37,6 +36,9 @@ func newActionHost() *wafenginmodel.HostSafe {
 // 人机验证动作不能自己返回拦截：挑战由检测链后面的验证码闸门发起，
 // 在这里拦下会让挑战页发不出去，已通过验证的访客再次超阈值时也会被判成普通拦截。
 func TestApplyCCAction_CaptchaDoesNotBlock(t *testing.T) {
+	old := global.GCACHE_WAFCACHE
+	global.GCACHE_WAFCACHE = cache.InitWafCache()
+	defer func() { global.GCACHE_WAFCACHE = old }()
 	waf := &WafEngine{}
 	log := &innerbean.WebLog{SRC_IP: "1.2.3.4"}
 
@@ -92,11 +94,11 @@ func TestApplyCCAction_CaptchaIsRepeatable(t *testing.T) {
 	}
 
 	// 通过验证：标记换成免挑战期
-	GrantCCCaptchaGrace(host.Host.Code, ip)
+	GrantCCCaptchaGrace(host.Host.Code, ip, model.ParseCaptchaConfig(""))
 	if IsCCCaptchaRequired(host.Host.Code, ip) {
 		t.Fatalf("通过验证后不应仍处于需验证状态")
 	}
-	if !isCCCaptchaInGrace(host.Host.Code, ip) {
+	if !isCCCaptchaInGrace(host.Host.Code, ip, model.ParseCaptchaConfig("")) {
 		t.Fatalf("通过验证后应进入免挑战期")
 	}
 
@@ -107,7 +109,7 @@ func TestApplyCCAction_CaptchaIsRepeatable(t *testing.T) {
 	}
 
 	// 免挑战期结束后再超阈值：重新要求验证
-	global.GCACHE_WAFCACHE.Remove(ccCaptchaGraceKey(host.Host.Code, ip))
+	global.GCACHE_WAFCACHE.Remove(ccCaptchaGraceKey(host.Host.Code, ip, model.ParseCaptchaConfig("")))
 	waf.applyCCAction(req, rule, &innerbean.WebLog{SRC_IP: ip}, host, ip, "hostcode")
 	if !IsCCCaptchaRequired(host.Host.Code, ip) {
 		t.Fatalf("免挑战期结束后再超阈值应重新要求验证，否则动作退化成一次性关卡")
@@ -121,8 +123,7 @@ func TestApplyCCAction_CaptchaRevokesStalePass(t *testing.T) {
 	defer func() { global.GCACHE_WAFCACHE = old }()
 
 	ip := "1.2.3.4"
-	token := "tok-abc"
-	global.GCACHE_WAFCACHE.SetWithTTl(enums.CACHE_CAPTCHA_PASS+token+ip, "ok", 24*time.Hour)
+	token := issueCCPass(t, "hostcode", ip)
 
 	req := httptest.NewRequest("GET", "/", nil)
 	req.AddCookie(&http.Cookie{Name: "samwaf_captcha_token", Value: token})
@@ -130,7 +131,7 @@ func TestApplyCCAction_CaptchaRevokesStalePass(t *testing.T) {
 	(&WafEngine{}).applyCCAction(req, newActionRule(model.CCActionCaptcha),
 		&innerbean.WebLog{SRC_IP: ip}, newActionHost(), ip, "hostcode")
 
-	if global.GCACHE_WAFCACHE.IsKeyExist(enums.CACHE_CAPTCHA_PASS + token + ip) {
+	if hasCaptchaPass(req, "hostcode", ip, model.ParseCaptchaConfig("")) {
 		t.Fatalf("超阈值后旧的通行凭证应被作废")
 	}
 }
@@ -156,7 +157,7 @@ func TestApplyCCAction_GraceIsDistinguishableInLog(t *testing.T) {
 	}
 
 	// 通过验证后进入免挑战期，再次超阈值
-	GrantCCCaptchaGrace(host.Host.Code, ip)
+	GrantCCCaptchaGrace(host.Host.Code, ip, model.ParseCaptchaConfig(""))
 	second := &innerbean.WebLog{SRC_IP: ip}
 	waf.applyCCAction(req, rule, second, host, ip, "hostcode")
 
@@ -195,7 +196,7 @@ func TestRequireCaptcha_SourceAndKeyCompat(t *testing.T) {
 	}
 
 	// 通过验证后来源要一并清掉，不能留到下一轮张冠李戴
-	GrantCCCaptchaGrace(host, ip)
+	GrantCCCaptchaGrace(host, ip, model.ParseCaptchaConfig(""))
 	if got := CaptchaRequireSource(host, ip); got != "" {
 		t.Fatalf("通过验证后来源应被清除，实际 %q", got)
 	}
@@ -214,4 +215,20 @@ func TestRequireCaptcha_NoSource(t *testing.T) {
 	if got := CaptchaRequireSource("h", "2.3.4.5"); got != "" {
 		t.Fatalf("未传来源时应返回空串，实际 %q", got)
 	}
+}
+
+// Exercise real v2 issuance rather than seeding legacy token+IP cache entries.
+func issueCCPass(t *testing.T, hostCode, ip string) string {
+	t.Helper()
+	r := httptest.NewRequest(http.MethodPost, "https://example.test/verify", nil)
+	w := httptest.NewRecorder()
+	token, err := wafcaptcha.IssuePass(global.GCACHE_WAFCACHE, w, r, hostCode, ip, model.ParseCaptchaConfig(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookies := w.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Value != token || !cookies[0].HttpOnly || !cookies[0].Secure || cookies[0].SameSite != http.SameSiteLaxMode {
+		t.Fatal("invalid pass cookie")
+	}
+	return token
 }

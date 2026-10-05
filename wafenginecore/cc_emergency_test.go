@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"SamWaf/cache"
-	"SamWaf/enums"
 	"SamWaf/global"
 	"SamWaf/innerbean"
 	"SamWaf/model"
@@ -90,14 +89,13 @@ func TestApplyEmergencyCaptcha_Lifecycle(t *testing.T) {
 	}
 
 	// ② 访客完成挑战，拿到凭证后再来
-	token := "tok-emg"
-	global.GCACHE_WAFCACHE.SetWithTTl(enums.CACHE_CAPTCHA_PASS+token+ip, "ok", time.Hour)
+	token := issueCCPass(t, host.Host.Code, ip)
 	req2 := httptest.NewRequest("GET", "/", nil)
 	req2.AddCookie(&http.Cookie{Name: "samwaf_captcha_token", Value: token})
 	log2 := &innerbean.WebLog{SRC_IP: ip}
 	waf.applyEmergencyCaptcha(req2, log2, host)
 
-	if !isCCCaptchaInGrace(host.Host.Code, ip) {
+	if !isCCCaptchaInGrace(host.Host.Code, ip, model.ParseCaptchaConfig("")) {
 		t.Fatalf("完成挑战后应进入免挑战期，否则每个请求都会被重新挑战")
 	}
 	if IsCCCaptchaRequired(host.Host.Code, ip) {
@@ -124,14 +122,13 @@ func TestApplyEmergencyCaptcha_RevokesStalePass(t *testing.T) {
 
 	host := newEmergencyHost("hostcode", 1, 0)
 	ip := "1.2.3.4"
-	token := "tok-stale"
-	global.GCACHE_WAFCACHE.SetWithTTl(enums.CACHE_CAPTCHA_PASS+token+ip, "ok", 24*time.Hour)
+	token := issueCCPass(t, host.Host.Code, ip)
 
 	req := httptest.NewRequest("GET", "/", nil)
 	req.AddCookie(&http.Cookie{Name: "samwaf_captcha_token", Value: token})
 	(&WafEngine{}).applyEmergencyCaptcha(req, &innerbean.WebLog{SRC_IP: ip}, host)
 
-	if global.GCACHE_WAFCACHE.IsKeyExist(enums.CACHE_CAPTCHA_PASS + token + ip) {
+	if hasCaptchaPass(req, "hostcode", ip, model.ParseCaptchaConfig("")) {
 		t.Fatalf("紧急模式要求验证时应作废陈旧凭证")
 	}
 }
