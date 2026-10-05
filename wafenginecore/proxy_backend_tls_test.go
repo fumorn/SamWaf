@@ -1,8 +1,6 @@
 package wafenginecore
 
 import (
-	"SamWaf/common/zlog"
-	"SamWaf/global"
 	"SamWaf/model"
 	"SamWaf/model/wafenginmodel"
 	"net/http"
@@ -12,7 +10,6 @@ import (
 // TestCreateTransport_BackendSchemeGatesTLS 验证：后端是否挂 TLS 配置由“后端协议”(backendScheme)决定，
 // 而非客户端连接协议 r.TLS。修复 “HTTP 进 → HTTPS 后端” 时 InsecureSkipVerify 被静默忽略的问题。
 func TestCreateTransport_BackendSchemeGatesTLS(t *testing.T) {
-	zlog.InitZLog(global.GWAF_LOG_DEBUG_ENABLE, "json")
 	waf := &WafEngine{}
 	// 客户端以明文 HTTP 进入（r.TLS == nil），后端为 HTTPS
 	r, _ := http.NewRequest(http.MethodGet, "http://127.0.0.1/", nil)

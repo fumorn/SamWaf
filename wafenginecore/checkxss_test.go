@@ -1,7 +1,6 @@
 package wafenginecore
 
 import (
-	"SamWaf/common/zlog"
 	"SamWaf/global"
 	"SamWaf/innerbean"
 	"SamWaf/model"
@@ -13,7 +12,6 @@ import (
 )
 
 func newTestWafForXSS() (*WafEngine, *wafenginmodel.HostSafe) {
-	zlog.InitZLog(global.GWAF_LOG_DEBUG_ENABLE, "json")
 	waf := &WafEngine{}
 	waf.InitRouting()
 	global.GWAF_GLOBAL_HOST_NAME = "全局网站"
