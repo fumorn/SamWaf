@@ -4,16 +4,15 @@ import (
 	"SamWaf/cache"
 	"SamWaf/common/uuid"
 	"SamWaf/common/zlog"
-	"SamWaf/enums"
 	"SamWaf/global"
 	"SamWaf/innerbean"
 	"SamWaf/model"
 	"SamWaf/utils"
 	"encoding/json"
-	"fmt"
 	"html"
 	"io/ioutil"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"path"
@@ -45,18 +44,18 @@ type CaptchaService struct {
 	textCapt      click.Captcha
 	lightTextCapt click.Captcha
 	//capJs
-	capJsCapt *capserver.Cap
+	capJsCapt *capserver.Engine
+	capMu     sync.Mutex
+	capWarn   sync.Once
+	capSlots  chan struct{}
+	capLimits map[string]capRateWindow
 }
 
 // InitCaptchaService 初始化验证码服务，传入缓存引用
 func InitCaptchaService(cache cache.CacheStore) {
 	once.Do(func() {
-		captchaService = &CaptchaService{
-			cache: cache,
-			capJsCapt: capserver.New(&capserver.CapConfig{
-				NoFSState: false,
-			}),
-		}
+		captchaService = &CaptchaService{cache: cache}
+
 		captchaService.InitTextCapt()
 	})
 }
@@ -161,6 +160,14 @@ func GetService() *CaptchaService {
 // HandleCaptchaRequest 处理验证码请求
 func (s *CaptchaService) HandleCaptchaRequest(w http.ResponseWriter, r *http.Request, weblog *innerbean.WebLog, captchaConfig model.CaptchaConfig, pathPrefix string, ipMode string) {
 
+	if err := model.ValidateCaptchaConfig(captchaConfig); err != nil {
+		http.Error(w, "Invalid verification configuration", http.StatusServiceUnavailable)
+		return
+	}
+	if captchaConfig.EngineType == model.CaptchaEngineCapJs {
+		s.handleModernCaptcha(w, r, weblog, captchaConfig, ipMode)
+		return
+	}
 	path := r.URL.Path
 	// 记录访问日志
 	zlog.Debug("验证码请求", zap.String("path", path), zap.String("method", r.Method), zap.String("remote_addr", r.RemoteAddr), zap.String("path_prefix", pathPrefix))
@@ -178,80 +185,38 @@ func (s *CaptchaService) HandleCaptchaRequest(w http.ResponseWriter, r *http.Req
 	}
 	limiterIP = requestLimiterIP(r, limiterIP)
 
-	// 只对 capJs 做特判，其余一律走传统方式。
-	// 早先这里是「两个 if、没有 else」：配置里出现不认识的验证方式时两个分支都不进，
-	// 函数什么都不写就返回，调用方紧接着 return —— 响应体是空的、挑战永远发不出来。
-	// 解析入口 model.ParseCaptchaConfig 已做归一化，这里再兜一层，防止绕过解析的调用方。
-	if captchaConfig.EngineType != model.CaptchaEngineCapJs {
-		//传统方式的验证码处理
-		if strings.HasPrefix(path, captchaPath+"/click_basic") {
-			if !s.allowCaptchaRequest(rateActionClickBasic, limiterIP, captchaRateIssueLimit) {
-				writeCaptchaRateLimited(w)
-				return
-			}
-			s.GetClickBasicCaptData(w, r)
-		} else if strings.HasPrefix(path, captchaPath+"/verify") {
-			if !s.allowCaptchaRequest(rateActionVerify, limiterIP, captchaRateCheckLimit) {
-				writeCaptchaRateLimited(w)
-				return
-			}
-			// 根据请求参数确定验证码类型
-			captchaType := r.URL.Query().Get("type")
-			s.VerifyCaptcha(w, r, captchaType, weblog, captchaConfig, ipMode)
-		} else if strings.HasPrefix(path, captchaPath+"/") {
-			cleanPath := strings.TrimPrefix(path, captchaPath+"/")
-			s.ServeStaticFile(w, r, cleanPath, captchaConfig)
-		} else {
-			// 记录日志信息
-			weblog.ACTION = "禁止"
-			// 保留上游已写入的触发原因（例如 CC 规则的人机验证动作），
-			// 直接覆盖会让日志里只剩"显示图形验证码"，查不出是哪条规则要求验证的
-			if weblog.RULE != "" {
-				weblog.RULE = weblog.RULE + " / 显示图形验证码"
-			} else {
-				weblog.RULE = "显示图形验证码"
-			}
-			global.GQEQUE_LOG_DB.Enqueue(weblog)
-			// 默认显示验证码选择页面
-			s.ShowCaptchaHomePage(w, r, captchaConfig, pathPrefix, weblog.REQ_UUID)
+	// 传统方式（capJs 已在上面分流到 handleModernCaptcha）。
+	// 上游限频保留：取题/交卷类接口按 IP 限频，抑制自动化刷量。
+	if path == captchaPath+"/click_basic" {
+		if !s.allowCaptchaRequest(rateActionClickBasic, limiterIP, captchaRateIssueLimit) {
+			writeCaptchaRateLimited(w)
+			return
 		}
+		s.GetClickBasicCaptData(w, r, weblog, captchaConfig, ipMode)
+	} else if path == captchaPath+"/verify" {
+		if !s.allowCaptchaRequest(rateActionVerify, limiterIP, captchaRateCheckLimit) {
+			writeCaptchaRateLimited(w)
+			return
+		}
+		// 根据请求参数确定验证码类型
+		captchaType := r.URL.Query().Get("type")
+		s.VerifyCaptcha(w, r, captchaType, weblog, captchaConfig, ipMode)
+	} else if strings.HasPrefix(path, captchaPath+"/") {
+		cleanPath := strings.TrimPrefix(path, captchaPath+"/")
+		s.ServeStaticFile(w, r, cleanPath, captchaConfig)
 	} else {
-		//基于工作量证明的验证码处理
-		if strings.HasPrefix(path, captchaPath+"/challenge") {
-			if !s.allowCaptchaRequest(rateActionChallenge, limiterIP, captchaRateIssueLimit) {
-				writeCaptchaRateLimited(w)
-				return
-			}
-			s.GetCapJsChallenge(w, r, captchaConfig)
-		} else if strings.HasPrefix(path, captchaPath+"/redeem") {
-			if !s.allowCaptchaRequest(rateActionRedeem, limiterIP, captchaRateCheckLimit) {
-				writeCaptchaRateLimited(w)
-				return
-			}
-			s.VerifyCapJsCaptcha(w, r, captchaConfig)
-		} else if strings.HasPrefix(path, captchaPath+"/validate") {
-			if !s.allowCaptchaRequest(rateActionValidate, limiterIP, captchaRateCheckLimit) {
-				writeCaptchaRateLimited(w)
-				return
-			}
-			s.ValidateCapJsCaptcha(w, r, captchaConfig, weblog, ipMode)
-		} else if strings.HasPrefix(path, captchaPath+"/") {
-			cleanPath := strings.TrimPrefix(path, captchaPath+"/")
-			s.ServeStaticFile(w, r, cleanPath, captchaConfig)
+		// 记录日志信息
+		weblog.ACTION = "禁止"
+		// 保留上游已写入的触发原因（例如 CC 规则的人机验证动作），
+		// 直接覆盖会让日志里只剩"显示图形验证码"，查不出是哪条规则要求验证的
+		if weblog.RULE != "" {
+			weblog.RULE = weblog.RULE + " / 显示图形验证码"
 		} else {
-			// 记录日志信息
-			weblog.ACTION = "禁止"
-			// 保留上游已写入的触发原因（例如 CC 规则的人机验证动作），
-			// 直接覆盖会让日志里只剩"显示CapJs验证码"，查不出是哪条规则要求验证的
-			if weblog.RULE != "" {
-				weblog.RULE = weblog.RULE + " / 显示CapJs验证码"
-			} else {
-				weblog.RULE = "显示CapJs验证码"
-			}
-			global.GQEQUE_LOG_DB.Enqueue(weblog)
-			// 默认显示验证码选择页面
-			s.ShowCaptchaHomePage(w, r, captchaConfig, pathPrefix, weblog.REQ_UUID)
+			weblog.RULE = "显示图形验证码"
 		}
+		global.GQEQUE_LOG_DB.Enqueue(weblog)
+		// 默认显示验证码选择页面
+		s.ShowCaptchaHomePage(w, r, captchaConfig, pathPrefix, weblog.REQ_UUID)
 	}
 
 }
@@ -330,7 +295,20 @@ func containsPathTraversal(filePath string) bool {
 }
 
 // GetClickBasicCaptData 获取基础点击验证码数据
-func (s *CaptchaService) GetClickBasicCaptData(w http.ResponseWriter, r *http.Request) {
+func (s *CaptchaService) GetClickBasicCaptData(w http.ResponseWriter, r *http.Request, weblog *innerbean.WebLog, cfg model.CaptchaConfig, ipMode string) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	clientIP := model.GetClientIPByMode(ipMode, weblog.NetSrcIp, weblog.SRC_IP)
+	scope := Scope(weblog.HOST_CODE, clientIP, cfg)
+	store, ok := s.cache.(cache.AtomicByteStore)
+	if !ok || scope == "" {
+		http.Error(w, "Verification unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
 	var capt click.Captcha
 
 	// 首先检查请求参数中是否指定了语言
@@ -410,7 +388,7 @@ func (s *CaptchaService) GetClickBasicCaptData(w http.ResponseWriter, r *http.Re
 			"code":    1,
 			"message": "gen captcha data failed",
 		})
-		_, _ = fmt.Fprintf(w, string(bt))
+		_, _ = w.Write(bt)
 		return
 	}
 
@@ -421,7 +399,7 @@ func (s *CaptchaService) GetClickBasicCaptData(w http.ResponseWriter, r *http.Re
 			"code":    1,
 			"message": "base64 data failed",
 		})
-		_, _ = fmt.Fprintf(w, string(bt))
+		_, _ = w.Write(bt)
 		return
 	}
 
@@ -431,14 +409,16 @@ func (s *CaptchaService) GetClickBasicCaptData(w http.ResponseWriter, r *http.Re
 			"code":    1,
 			"message": "base64 data failed",
 		})
-		_, _ = fmt.Fprintf(w, string(bt))
+		_, _ = w.Write(bt)
 		return
 	}
 
 	dotsByte, _ := json.Marshal(dotData)
 	key := uuid.GenUUID()
-	//key := helper.StringToMD5(string(dotsByte))
-	s.cache.SetWithTTl(enums.CACHE_CAPTCHA_TRY+key, dotsByte, 1*time.Minute)
+	if err := store.PutBytes(r.Context(), "CAP_V2_CLICK:"+scope+":"+key, dotsByte, time.Now().Add(time.Minute)); err != nil {
+		http.Error(w, "Verification storage unavailable", http.StatusServiceUnavailable)
+		return
+	}
 
 	bt, _ := json.Marshal(map[string]interface{}{
 		"code":         0,
@@ -447,15 +427,25 @@ func (s *CaptchaService) GetClickBasicCaptData(w http.ResponseWriter, r *http.Re
 		"thumb_base64": thumbImageBase64,
 	})
 
-	_, _ = fmt.Fprintf(w, string(bt))
+	_, _ = w.Write(bt)
 }
 
 // VerifyCaptcha 验证验证码
 func (s *CaptchaService) VerifyCaptcha(w http.ResponseWriter, r *http.Request, captchaType string, webLog *innerbean.WebLog, captchaConfig model.CaptchaConfig, ipMode string) {
 	// 根据IP模式选择使用的IP（从 Host 级别传入）
 	clientIP := model.GetClientIPByMode(ipMode, webLog.NetSrcIp, webLog.SRC_IP)
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	r.Body = http.MaxBytesReader(w, r.Body, 8192)
 	code := 1
-	_ = r.ParseForm()
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "Invalid form", http.StatusBadRequest)
+		return
+	}
 	dots := r.Form.Get("dots")
 	key := r.Form.Get("key")
 	if dots == "" || key == "" {
@@ -463,26 +453,31 @@ func (s *CaptchaService) VerifyCaptcha(w http.ResponseWriter, r *http.Request, c
 			"code":    code,
 			"message": "dots or key param is empty",
 		})
-		_, _ = fmt.Fprintf(w, string(bt))
+		_, _ = w.Write(bt)
 		return
 	}
 
-	cacheDataByte, err := s.cache.GetBytes(enums.CACHE_CAPTCHA_TRY + key)
-	if err != nil {
+	store, ok := s.cache.(cache.AtomicByteStore)
+	scope := Scope(webLog.HOST_CODE, clientIP, captchaConfig)
+	if !ok || scope == "" {
+		http.Error(w, "Verification unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	cacheDataByte, found, err := store.TakeBytes(r.Context(), "CAP_V2_CLICK:"+scope+":"+key)
+	if err != nil || !found {
 		bt, _ := json.Marshal(map[string]interface{}{
 			"code":    code,
 			"message": "illegal key",
 		})
-		_, _ = fmt.Fprintf(w, string(bt))
+		_, _ = w.Write(bt)
 		return
 	}
-	s.cache.Remove(enums.CACHE_CAPTCHA_TRY + key)
 	if len(cacheDataByte) == 0 {
 		bt, _ := json.Marshal(map[string]interface{}{
 			"code":    code,
 			"message": "illegal key",
 		})
-		_, _ = fmt.Fprintf(w, string(bt))
+		_, _ = w.Write(bt)
 		return
 	}
 	src := strings.Split(dots, ",")
@@ -493,7 +488,7 @@ func (s *CaptchaService) VerifyCaptcha(w http.ResponseWriter, r *http.Request, c
 			"code":    code,
 			"message": "illegal key",
 		})
-		_, _ = fmt.Fprintf(w, string(bt))
+		_, _ = w.Write(bt)
 		return
 	}
 
@@ -518,8 +513,12 @@ func (s *CaptchaService) VerifyCaptcha(w http.ResponseWriter, r *http.Request, c
 			dot := dct[i]
 			j := i * 2
 			k := i*2 + 1
-			sx, _ := strconv.ParseFloat(fmt.Sprintf("%v", src[j]), 64)
-			sy, _ := strconv.ParseFloat(fmt.Sprintf("%v", src[k]), 64)
+			sx, xerr := strconv.ParseFloat(src[j], 64)
+			sy, yerr := strconv.ParseFloat(src[k], 64)
+			if xerr != nil || yerr != nil || math.IsNaN(sx) || math.IsNaN(sy) || math.IsInf(sx, 0) || math.IsInf(sy, 0) || sx < 0 || sy < 0 || sx > 10000 || sy > 10000 || dot == nil {
+				chkRet = false
+				break
+			}
 
 			chkRet = click.CheckPoint(int64(sx), int64(sy), int64(dot.X), int64(dot.Y), int64(dot.Width), int64(dot.Height), 0)
 			if !chkRet {
@@ -530,24 +529,10 @@ func (s *CaptchaService) VerifyCaptcha(w http.ResponseWriter, r *http.Request, c
 
 	if chkRet {
 		code = 0
-		// 生成验证通过的标识
-		captchaPassToken := uuid.GenUUID()
-		// 将标识存入缓存
-		s.cache.SetWithTTl(enums.CACHE_CAPTCHA_PASS+captchaPassToken+clientIP, "ok", time.Duration(captchaConfig.ExpireTime)*time.Hour)
-
-		// 设置Cookie
-		cookie := &http.Cookie{
-			Name:     "samwaf_captcha_token",
-			Value:    captchaPassToken,
-			Path:     "/",
-			HttpOnly: true,
-			Secure:   r.TLS != nil, // 如果是HTTPS请求则设置Secure
-			MaxAge:   int(captchaConfig.ExpireTime) * 3600,
+		if _, err := IssuePass(s.cache, w, r, webLog.HOST_CODE, clientIP, captchaConfig); err != nil {
+			http.Error(w, "Verification storage unavailable", http.StatusServiceUnavailable)
+			return
 		}
-		http.SetCookie(w, cookie)
-
-		// 同时在响应头中也设置验证标识
-		w.Header().Set("X-SamWaf-Captcha-Token", captchaPassToken)
 		webLog.ACTION = "放行"
 		webLog.RULE = "图形验证码验证通过"
 		global.GQEQUE_LOG_DB.Enqueue(webLog)
@@ -560,7 +545,7 @@ func (s *CaptchaService) VerifyCaptcha(w http.ResponseWriter, r *http.Request, c
 	bt, _ := json.Marshal(map[string]interface{}{
 		"code": code,
 	})
-	_, _ = fmt.Fprintf(w, string(bt))
+	_, _ = w.Write(bt)
 	return
 }
 
@@ -670,205 +655,8 @@ func (s *CaptchaService) ShowCaptchaHomePage(w http.ResponseWriter, r *http.Requ
 
 		w.Write([]byte(htmlStr))
 	} else {
-		// 读取HTML模板文件
-		htmlPath := utils.GetCurrentDir() + "/data/capjs/index.html"
-		htmlContent, err := ioutil.ReadFile(htmlPath)
-		if err != nil {
-			http.Error(w, "Failed to load page", http.StatusInternalServerError)
-			return
-		}
-
-		// 准备替换的数据
-		htmlStr := string(htmlContent)
-
-		// 替换路径前缀
-		htmlStr = strings.ReplaceAll(htmlStr, "/samwaf_captcha/", pathPrefix+"/")
-		htmlStr = strings.ReplaceAll(htmlStr, "'/samwaf_captcha'", "'"+pathPrefix+"'")
-		htmlStr = strings.ReplaceAll(htmlStr, "\"/samwaf_captcha\"", "\""+pathPrefix+"\"")
-
-		// 替换中文提示信息
-		zhInfoTitle := configStruct.CapJsConfig.InfoTitle.Zh
-		zhInfoText := configStruct.CapJsConfig.InfoText.Zh
-		if zhInfoTitle == "" {
-			zhInfoTitle = "安全验证"
-		}
-		if zhInfoText == "" {
-			zhInfoText = "为了确保您的访问安全，请完成以下验证"
-		}
-
-		// 替换英文提示信息
-		enInfoTitle := configStruct.CapJsConfig.InfoTitle.En
-		enInfoText := configStruct.CapJsConfig.InfoText.En
-		if enInfoTitle == "" {
-			enInfoTitle = "Security Verification"
-		}
-		if enInfoText == "" {
-			enInfoText = "To ensure the security of your access, please complete the following verification"
-		}
-
-		// 使用strings.Replace替换HTML中的静态文本
-		htmlStr = strings.Replace(htmlStr, "infoTitle: '安全验证',", fmt.Sprintf("infoTitle: '%s',", zhInfoTitle), 1)
-		htmlStr = strings.Replace(htmlStr, "infoText: '为了确保您的访问安全，请完成以下验证',", fmt.Sprintf("infoText: '%s',", zhInfoText), 1)
-		htmlStr = strings.Replace(htmlStr, "infoTitle: 'Security Verification',", fmt.Sprintf("infoTitle: '%s',", enInfoTitle), 1)
-		htmlStr = strings.Replace(htmlStr, "infoText: 'To ensure the security of your access, please complete the following verification',", fmt.Sprintf("infoText: '%s',", enInfoText), 1)
-
-		// 同时替换HTML中的默认显示文本
-		htmlStr = strings.Replace(htmlStr, "<h2 id=\"info-title\">安全验证</h2>", fmt.Sprintf("<h2 id=\"info-title\">%s</h2>", zhInfoTitle), 1)
-		htmlStr = strings.Replace(htmlStr, "<p id=\"info-text\">为了确保您的访问安全，请完成以下验证</p>", fmt.Sprintf("<p id=\"info-text\">%s</p>", zhInfoText), 1)
-
-		htmlStr = injectReqUUID(htmlStr, reqUUID)
-		htmlStr = injectContact(htmlStr, configStruct.ContactInfo)
-
-		// 输出修改后的HTML
-		w.Write([]byte(htmlStr))
+		s.showModernCaptcha(w, r, configStruct, pathPrefix, reqUUID)
 	}
-}
-
-func (s *CaptchaService) GetCapJsChallenge(w http.ResponseWriter, r *http.Request, configStruct model.CaptchaConfig) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-
-	config := &capserver.ChallengeConfig{
-		ChallengeCount:      int(configStruct.CapJsConfig.ChallengeCount),
-		ChallengeSize:       int(configStruct.CapJsConfig.ChallengeSize),
-		ChallengeDifficulty: int(configStruct.CapJsConfig.ChallengeDifficulty),
-		ExpiresMs:           int(configStruct.CapJsConfig.ExpiresMs),
-		Store:               true,
-	}
-
-	challenge, err := s.capJsCapt.CreateChallenge(config)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to create challenge: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	json.NewEncoder(w).Encode(challenge)
-}
-
-func (s *CaptchaService) VerifyCapJsCaptcha(w http.ResponseWriter, r *http.Request, configStruct model.CaptchaConfig) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-
-	var req struct {
-		Token     string          `json:"token"`
-		Solutions [][]interface{} `json:"solutions"` // Array of [salt, target, solution] tuples
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	if req.Token == "" {
-		http.Error(w, "Token is required", http.StatusBadRequest)
-		return
-	}
-
-	if len(req.Solutions) == 0 {
-		http.Error(w, "Solution is required", http.StatusBadRequest)
-		return
-	}
-
-	// Create solution structure with [salt, target, solution] format
-	solution := &capserver.Solution{
-		Token:     req.Token,
-		Solutions: req.Solutions,
-	}
-
-	result, err := s.capJsCapt.RedeemChallenge(solution)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to redeem challenge: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	response := map[string]interface{}{
-		"success": result.Success,
-	}
-
-	if result.Success && result.Token != "" {
-		response["token"] = result.Token
-	}
-	if result.Success && result.Expires > 0 {
-		response["expires"] = result.Expires
-	}
-
-	json.NewEncoder(w).Encode(response)
-}
-
-func (s *CaptchaService) ValidateCapJsCaptcha(w http.ResponseWriter, r *http.Request, configStruct model.CaptchaConfig, webLog *innerbean.WebLog, ipMode string) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-
-	var req struct {
-		Token string `json:"token"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
-	}
-
-	if req.Token == "" {
-		http.Error(w, "Token is required", http.StatusBadRequest)
-		return
-	}
-
-	// 根据IP模式选择使用的IP（从 Host 级别传入）
-	clientIP := model.GetClientIPByMode(ipMode, webLog.NetSrcIp, webLog.SRC_IP)
-
-	result, err := s.capJsCapt.ValidateToken(req.Token, nil)
-	if err != nil {
-		webLog.ACTION = "禁止"
-		webLog.RULE = "CapJs验证码验证失败"
-		global.GQEQUE_LOG_DB.Enqueue(webLog)
-		http.Error(w, fmt.Sprintf("Failed to validate token: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	if result.Success {
-		// 生成验证通过的标识
-		captchaPassToken := uuid.GenUUID()
-		// 将标识存入缓存
-		s.cache.SetWithTTl(enums.CACHE_CAPTCHA_PASS+captchaPassToken+clientIP, "ok", time.Duration(configStruct.ExpireTime)*time.Hour)
-
-		// 设置Cookie
-		cookie := &http.Cookie{
-			Name:     "samwaf_captcha_token",
-			Value:    captchaPassToken,
-			Path:     "/",
-			HttpOnly: true,
-			Secure:   r.TLS != nil, // 如果是HTTPS请求则设置Secure
-			MaxAge:   int(configStruct.ExpireTime) * 3600,
-		}
-		http.SetCookie(w, cookie)
-
-		// 同时在响应头中也设置验证标识
-		w.Header().Set("X-SamWaf-Captcha-Token", captchaPassToken)
-		webLog.ACTION = "放行"
-		webLog.RULE = "CapJs验证码验证通过"
-		global.GQEQUE_LOG_DB.Enqueue(webLog)
-	} else {
-		webLog.ACTION = "禁止"
-		webLog.RULE = "CapJs验证码验证失败"
-		global.GQEQUE_LOG_DB.Enqueue(webLog)
-	}
-
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": result.Success,
-		"message": "1",
-	})
 }
 
 // 辅助函数

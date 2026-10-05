@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <title id="page-title">进行验证</title>
+
+  <style>
+    html, body {
+      width: 100%;
+      height: 100%;
+      padding: 0;
+      margin: 0;
+      color: #3C3C3C;
+      background: #EBF3FB;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+    }
+
+    .container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 40px 0;
+    }
+
+    .lang-switch {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 5px 10px;
+      cursor: pointer;
+      font-size: 14px;
+      color: #3C3C3C;
+    }
+
+    .lang-switch:hover {
+      background: #f5f5f5;
+    }
+
+    .success-message {
+      color: #5eaa2f;
+      text-align: center;
+      font-size: 18px;
+      margin-top: 20px;
+      font-family: system, -apple-system, "BlinkMacSystemFont",
+      ".SFNSText-Regular", "San Francisco", "Roboto", "Segoe UI",
+      "Helvetica Neue", "Lucida Grande", "Ubuntu", "arial", sans-serif;
+    }
+
+    .error-message {
+      color: #ed4630;
+      text-align: center;
+      font-size: 16px;
+      margin-top: 20px;
+      font-family: system, -apple-system, "BlinkMacSystemFont",
+      ".SFNSText-Regular", "San Francisco", "Roboto", "Segoe UI",
+      "Helvetica Neue", "Lucida Grande", "Ubuntu", "arial", sans-serif;
+    }
+
+    /* Toast样式 */
+    .toast {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      padding: 12px 24px;
+      border-radius: 6px;
+      font-size: 14px;
+      z-index: 1000;
+      opacity: 0;
+      transition: opacity 0.3s ease;
+    }
+
+    .toast.show {
+      opacity: 1;
+    }
+
+    .toast.success {
+      background: #f0f9eb;
+      border: 1px solid #dcf9cc;
+      color: #5eaa2f;
+      box-shadow: 1px 1px 10px #e0e0e0;
+    }
+
+    .toast.error {
+      background: #fef0f0;
+      border: 1px solid #fcd6d6;
+      color: #ed4630;
+      box-shadow: 1px 1px 10px #e0e0e0;
+    }
+  </style>
+  <script defer src="{{.Prefix}}/v2/assets/app.js"></script>
+</head>
+<body id="samwaf-cap-page" data-prefix="{{.Prefix}}" data-request-method="{{.RequestMethod}}" data-title-zh="{{.TitleZh}}" data-title-en="{{.TitleEn}}" data-text-zh="{{.TextZh}}" data-text-en="{{.TextEn}}">
+  <button id="lang-switch" class="lang-switch">English</button>
+
+  <div class="container">
+    <!-- 添加提示信息区域 -->
+    <div class="info-message" id="info-message">
+      <h2 id="info-title">安全验证</h2>
+      <p id="info-text">为了确保您的访问安全，请完成以下验证</p>
+    </div>
+
+    <cap-widget
+            id="cap"
+            data-cap-api-endpoint="{{.Prefix}}/v2/"
+            data-cap-i18n-verifying-label="验证中..."
+            data-cap-i18n-initial-state="我是人类"
+            data-cap-i18n-solved-label="我是人类"
+            data-cap-i18n-error-label="错误"
+    ></cap-widget>
+  </div>
+  {{if .RequestID}}<div style="margin:10px auto;text-align:center;font-size:12px;color:#8a8f99;word-break:break-all">识别码 / Ref: <code style="font-family:Consolas,Menlo,monospace">{{.RequestID}}</code></div>{{end}}
+  {{if .ContactInfo}}<div style="margin:10px auto;text-align:center;font-size:12px;color:#8a8f99;word-break:break-all;white-space:pre-line">{{.ContactInfo}}</div>{{end}}
+  <noscript><p class="error-message">此验证需要 JavaScript，请启用后重新打开本页。<br>JavaScript is required. Enable it and reopen this page.</p></noscript>
+</body>
+</html>
