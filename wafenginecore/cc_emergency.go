@@ -4,6 +4,7 @@ import (
 	"SamWaf/innerbean"
 	"SamWaf/model"
 	"SamWaf/model/wafenginmodel"
+	"errors"
 	"net/http"
 	"time"
 )
@@ -37,9 +38,9 @@ func (waf *WafEngine) isEmergencyOn(hostTarget, globalHost *wafenginmodel.HostSa
 // 它不看阈值、不看规则命中，是站点级总闸；也不改动任何一条 CC 规则——
 // 把规则的动作改掉再改回来，中间出任何岔子都恢复不回原样，
 // 而这个开关多半是在被打的时候按下的。
-func (waf *WafEngine) applyEmergencyCaptcha(r *http.Request, weblogbean *innerbean.WebLog, hostTarget *wafenginmodel.HostSafe) {
+func (waf *WafEngine) applyEmergencyCaptcha(r *http.Request, weblogbean *innerbean.WebLog, hostTarget *wafenginmodel.HostSafe) error {
 	if hostTarget == nil || weblogbean == nil {
-		return
+		return nil
 	}
 	hostCode := hostTarget.Host.Code
 	ip := model.GetClientIPByMode(hostTarget.Host.IPMode, weblogbean.NetSrcIp, weblogbean.SRC_IP)
@@ -49,20 +50,30 @@ func (waf *WafEngine) applyEmergencyCaptcha(r *http.Request, weblogbean *innerbe
 		ip = weblogbean.SRC_IP
 	}
 	if ip == "" {
-		return
+		return errors.New("missing CAPTCHA client IP")
 	}
-	if isCCCaptchaInGrace(hostCode, ip) {
+	cfg, err := model.DecodeCaptchaConfig(hostTarget.Host.CaptchaJSON)
+	if err != nil {
+		return err
+	}
+	if isCCCaptchaInGrace(hostCode, ip, cfg) {
 		weblogbean.RULE = "CC紧急模式-免挑战期内放行"
-		return
+		return nil
 	}
 	// 与 CC 规则动作同一处理：上一轮要求过验证、这次带着有效凭证来了，就地换成免挑战期。
 	// 少了这一步，下面的作废会把访客刚拿到的凭证删掉，形成「怎么点都点不完」的挑战循环。
-	if IsCCCaptchaRequired(hostCode, ip) && hasCaptchaPass(r, ip) {
-		GrantCCCaptchaGrace(hostCode, ip)
+	if IsCCCaptchaRequired(hostCode, ip) && hasCaptchaPass(r, hostCode, ip, cfg) {
+		GrantCCCaptchaGrace(hostCode, ip, cfg)
 		weblogbean.RULE = "CC紧急模式-本轮已通过"
-		return
+		return nil
 	}
 	weblogbean.RULE = "CC紧急模式"
-	revokeCaptchaPass(r, ip)
+	if err := revokeCaptchaPass(r, hostCode, ip, cfg); err != nil {
+		return err
+	}
 	RequireCaptcha(hostCode, ip, emergencyGraceSeconds, "紧急模式")
+	if !IsCCCaptchaRequired(hostCode, ip) {
+		return errors.New("unable to persist CAPTCHA requirement")
+	}
+	return nil
 }

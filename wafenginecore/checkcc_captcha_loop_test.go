@@ -4,10 +4,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 
 	"SamWaf/cache"
-	"SamWaf/enums"
 	"SamWaf/global"
 	"SamWaf/innerbean"
 	"SamWaf/model"
@@ -18,8 +16,8 @@ import (
 // 否则免挑战期永远发不出来。
 func gateStep(t *testing.T, r *http.Request, hostCode, ip string) {
 	t.Helper()
-	if IsCCCaptchaRequired(hostCode, ip) && hasCaptchaPass(r, ip) {
-		GrantCCCaptchaGrace(hostCode, ip)
+	if IsCCCaptchaRequired(hostCode, ip) && hasCaptchaPass(r, hostCode, ip, model.ParseCaptchaConfig("")) {
+		GrantCCCaptchaGrace(hostCode, ip, model.ParseCaptchaConfig(""))
 	}
 }
 
@@ -48,8 +46,7 @@ func TestApplyCCAction_GraceReachableAfterVisitorPassed(t *testing.T) {
 	}
 
 	// ② 访客完成挑战，拿到通行凭证
-	token := "tok-fresh"
-	global.GCACHE_WAFCACHE.SetWithTTl(enums.CACHE_CAPTCHA_PASS+token+ip, "ok", 24*time.Hour)
+	token := issueCCPass(t, host.Host.Code, ip)
 
 	// ③ 下一个请求：仍在计数窗口内，还是会超阈值，于是又走一遍 CC 检测再进闸门
 	req2 := httptest.NewRequest("GET", "/", nil)
@@ -57,7 +54,7 @@ func TestApplyCCAction_GraceReachableAfterVisitorPassed(t *testing.T) {
 	waf.applyCCAction(req2, rule, &innerbean.WebLog{SRC_IP: ip}, host, ip, "hostcode")
 	gateStep(t, req2, host.Host.Code, ip)
 
-	if !isCCCaptchaInGrace(host.Host.Code, ip) {
+	if !isCCCaptchaInGrace(host.Host.Code, ip, model.ParseCaptchaConfig("")) {
 		t.Fatalf("访客已完成挑战，应进入免挑战期；否则每个请求都会被重新挑战")
 	}
 	if IsCCCaptchaRequired(host.Host.Code, ip) {
@@ -83,8 +80,7 @@ func TestApplyCCAction_StalePassStillRevokedWhenNotChallenged(t *testing.T) {
 
 	host := newActionHost()
 	ip := "1.2.3.4"
-	token := "tok-stale"
-	global.GCACHE_WAFCACHE.SetWithTTl(enums.CACHE_CAPTCHA_PASS+token+ip, "ok", 24*time.Hour)
+	token := issueCCPass(t, host.Host.Code, ip)
 
 	req := httptest.NewRequest("GET", "/", nil)
 	req.AddCookie(&http.Cookie{Name: "samwaf_captcha_token", Value: token})
@@ -93,13 +89,13 @@ func TestApplyCCAction_StalePassStillRevokedWhenNotChallenged(t *testing.T) {
 	(&WafEngine{}).applyCCAction(req, newActionRule(model.CCActionCaptcha),
 		&innerbean.WebLog{SRC_IP: ip}, host, ip, "hostcode")
 
-	if global.GCACHE_WAFCACHE.IsKeyExist(enums.CACHE_CAPTCHA_PASS + token + ip) {
+	if hasCaptchaPass(req, "hostcode", ip, model.ParseCaptchaConfig("")) {
 		t.Fatalf("此前未要求过验证时，陈旧凭证应被作废")
 	}
 	if !IsCCCaptchaRequired(host.Host.Code, ip) {
 		t.Fatalf("陈旧凭证被作废后应要求重新验证")
 	}
-	if isCCCaptchaInGrace(host.Host.Code, ip) {
+	if isCCCaptchaInGrace(host.Host.Code, ip, model.ParseCaptchaConfig("")) {
 		t.Fatalf("陈旧凭证不该被当成「本轮已通过」而直接进免挑战期")
 	}
 }
