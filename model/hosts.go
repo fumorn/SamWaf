@@ -218,76 +218,50 @@ type CaptchaConfig struct {
 	ExpireTime      FlexInt   `json:"expire_time"`       // 验证通过后的有效期(小时)
 	IPMode          string    `json:"ip_mode"`           // IP提取模式: "nic" 网卡模式 或 "proxy" 代理模式
 	EngineType      string    `json:"engine_type"`       // 验证码引擎类型: 传统方式 "traditional",capJS工作量证明 "capJs"
-	PathPrefix      string    `json:"path_prefix"`       // 验证码路径前缀，用于隐藏系统特征，默认为随机生成
+	// PassBinding 通行凭证的绑定维度：""/"ip"（默认，两者等价，仅绑定客户端 IP）或
+	// "ip+tls"（在 IP 之上再把凭证绑定到请求的 TLS 指纹）。取值见 CaptchaPassBinding* 常量。
+	// 保存期枚举校验拒绝其它值；"ip+tls" 还要求站点启用 SSL（waf_host 保存期跨字段校验）；
+	// 运行期 Parse 遇非法存量值安全回退为 "ip"（非破坏性），引擎侧对无指纹请求 fail closed。
+	PassBinding string `json:"passBinding,omitempty"` // 通行凭证绑定维度: ""/"ip" 或 "ip+tls"
+	// PathPrefix 验证码路径前缀，用于隐藏系统特征，默认为随机生成
+	PathPrefix string `json:"path_prefix"` // 验证码路径前缀，用于隐藏系统特征，默认为随机生成
 	// ContactInfo 管理员联系方式，填了就显示在挑战页上，留空则整块不渲染。
 	//
 	// 挑战页对访客是个死胡同：被挡住之后既进不去、也没地方问。这一栏就是给这种情况留的出口。
 	// 内容由管理员自己写（邮箱、电话、工单地址、一句说明都行），渲染时**必须 HTML 转义**——
 	// 它出现在给访客看的公开页面上。
-	ContactInfo string `json:"contact_info"` // 挑战页展示的管理员联系方式，留空=不显示
-	CapJsConfig struct {
-		ChallengeCount      FlexInt `json:"challengeCount,omitempty"`      // Number of challenges to generate (default: 50)
-		ChallengeSize       FlexInt `json:"challengeSize,omitempty"`       // Size of each challenge in bytes (default: 32)
-		ChallengeDifficulty FlexInt `json:"challengeDifficulty,omitempty"` // Difficulty level (default: 4)
-		ExpiresMs           FlexInt `json:"expiresMs,omitempty"`           // Expiration time in milliseconds (default: 600000)
-		InfoTitle           struct {
-			En string `json:"en,omitempty"` // English title
-			Zh string `json:"zh,omitempty"` // Chinese title
-		} `json:"infoTitle,omitempty"` // Multi-language info title
-		InfoText struct {
-			En string `json:"en,omitempty"` // English text
-			Zh string `json:"zh,omitempty"` // Chinese text
-		} `json:"infoText,omitempty"` // Multi-language info text
-	} `json:"cap_js_config"`
+	ContactInfo string             `json:"contact_info"` // 挑战页展示的管理员联系方式，留空=不显示
+	CapJsConfig CaptchaCapJSConfig `json:"cap_js_config"`
 }
 
-// ParseCaptchaConfig 解析验证码配置
+// ParseCaptchaConfig 是兼容旧调用者的运行期入口。解析失败整份回落默认值，
+// 不再返回 encoding/json 已部分填充的结构；保存期应使用 NormalizeCaptchaJSON。
+// 存量未知字段在此只读入口忽略，管理保存则明确拒绝，避免重序列化静默丢字段。
 func ParseCaptchaConfig(captchaJSON string) CaptchaConfig {
-	var config CaptchaConfig
-
-	// 设置默认值
-	config.IsEnableCaptcha = 0
-	config.ExcludeURLs = ""
-	config.ExpireTime = 24
-	config.IPMode = "nic"             // 默认使用网卡模式
-	config.EngineType = "traditional" // 默认使用传统方式
-
-	// 初始化CapJsConfig默认值
-	config.CapJsConfig.ChallengeCount = 50     // 默认生成50个挑战
-	config.CapJsConfig.ChallengeSize = 32      // 默认每个挑战32字节
-	config.CapJsConfig.ChallengeDifficulty = 4 // 默认难度级别4
-	config.CapJsConfig.ExpiresMs = 600000      // 默认过期时间600秒(10分钟)
-
-	// 初始化InfoTitle默认值
-	config.CapJsConfig.InfoTitle.Zh = "安全验证"
-	config.CapJsConfig.InfoTitle.En = "Security Verification"
-
-	// 初始化InfoText默认值
-	config.CapJsConfig.InfoText.Zh = "为了确保您的访问安全，请完成以下验证"
-	config.CapJsConfig.InfoText.En = "To ensure the security of your access, please complete the following verification"
-
-	// 如果JSON不为空，则解析覆盖默认值
-	if captchaJSON != "" {
-		err := json.Unmarshal([]byte(captchaJSON), &config)
-		if err != nil {
-			// 解析失败时使用默认值，可以记录日志
-			return config
+	config := DefaultCaptchaConfig()
+	if strings.TrimSpace(captchaJSON) != "" {
+		if err := json.Unmarshal([]byte(captchaJSON), &config); err != nil {
+			return DefaultCaptchaConfig()
 		}
 	}
-	// 归一化验证方式：只认 traditional / capJs，其余一律按 traditional。
-	//
-	// 存量数据里出现过 "default" 这种当前代码不认的值（更早版本或导入留下的）。
-	// 下游按 EngineType 分发挑战页时是「两个 if，没有 else」，
-	// 取到不认识的值就两个分支都不进、什么都不写——响应是空的、挑战永远发不出来，
-	// 而配置、日志、界面上一切正常。在解析入口收口，所有下游一次性受益。
 	if config.EngineType != CaptchaEngineTraditional && config.EngineType != CaptchaEngineCapJs {
 		config.EngineType = CaptchaEngineTraditional
 	}
-	// 联系方式要显示在公开的挑战页上，在解析入口就把长度封住：
-	// 这段文本来自管理端输入，界面上限制得住，直接改库或旧数据限制不住。
+	// passBinding：直接改库/更早版本可能留下枚举外的存量值。这里不整份回落默认，
+	// 而是把非法值归一为默认 "ip"（安全非破坏回退）：站点照常可用，只是回到
+	// 只绑定 IP 的现行为；既不放行未知绑定模式，也不因一个字段废掉整份配置。
+	switch config.PassBinding {
+	case "", CaptchaPassBindingIP, CaptchaPassBindingIPTLS:
+	default:
+		config.PassBinding = CaptchaPassBindingIP
+	}
 	config.ContactInfo = strings.TrimSpace(config.ContactInfo)
 	if n := []rune(config.ContactInfo); len(n) > CaptchaContactMaxRunes {
 		config.ContactInfo = string(n[:CaptchaContactMaxRunes])
+	}
+	fillCaptchaDefaults(&config)
+	if err := ValidateCaptchaConfig(config); err != nil {
+		return DefaultCaptchaConfig()
 	}
 	return config
 }
@@ -296,6 +270,15 @@ func ParseCaptchaConfig(captchaJSON string) CaptchaConfig {
 const (
 	CaptchaEngineTraditional = "traditional"
 	CaptchaEngineCapJs       = "capJs"
+)
+
+// 通行凭证（pass）绑定维度：""/"ip" 等价（默认，仅绑定站点+完整策略+客户端 IP）；
+// "ip+tls" 在此之上再把凭证绑定到请求的 TLS 指纹（换浏览器/换 TLS 栈复用凭证立即失效）。
+// "ip+tls" 要求站点启用 SSL（waf_host 保存期跨字段校验拒绝），明文 HTTP 站点禁配；
+// 传统点选引擎与 capJs 共用 IssuePass/HasPass，绑定对两种引擎同样生效。
+const (
+	CaptchaPassBindingIP    = "ip"
+	CaptchaPassBindingIPTLS = "ip+tls"
 )
 
 // CaptchaContactMaxRunes 挑战页联系方式的长度上限（按字符算，不是字节）。
