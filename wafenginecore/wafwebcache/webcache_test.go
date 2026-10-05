@@ -68,7 +68,7 @@ func TestMemoryCache(t *testing.T) {
 	timeout := 10
 
 	// 测试存储到内存缓存
-	storeMemory(hostCode, key, testData, timeout)
+	storeMemory(hostCode, key, testData, timeout, 0) // maxSize=0：不限制缓存大小（MB）
 
 	// 测试从内存缓存加载
 	data := loadFormMemory(hostCode, key)
@@ -96,7 +96,7 @@ func TestFileCache(t *testing.T) {
 	timeout := 60
 
 	// 测试存储到文件缓存
-	storeFile(hostCode, key, testData, tempDir, timeout)
+	storeFile(hostCode, key, testData, tempDir, timeout, 0) // maxSize=0：不限制缓存大小（MB）
 
 	// 测试从文件缓存加载
 	data := loadFormFile(hostCode, key, tempDir)

@@ -1,7 +1,6 @@
 package wafenginecore
 
 import (
-	"SamWaf/common/zlog"
 	"SamWaf/global"
 	"SamWaf/innerbean"
 	"SamWaf/model"
@@ -15,8 +14,6 @@ import (
 func TestCheckDenyURL(t *testing.T) {
 	t.Parallel()
 
-	//初始化日志
-	zlog.InitZLog(global.GWAF_LOG_DEBUG_ENABLE, "json")
 	// 初始化 WAF 引擎
 	waf := &WafEngine{}
 	waf.InitRouting()

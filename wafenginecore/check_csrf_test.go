@@ -1,8 +1,6 @@
 package wafenginecore
 
 import (
-	"SamWaf/common/zlog"
-	"SamWaf/global"
 	"SamWaf/innerbean"
 	"SamWaf/model"
 	"SamWaf/model/wafenginmodel"
@@ -13,7 +11,6 @@ import (
 )
 
 func TestCheckCsrf(t *testing.T) {
-	zlog.InitZLog(global.GWAF_LOG_DEBUG_ENABLE, "json")
 	waf := &WafEngine{}
 	waf.InitRouting()
 
