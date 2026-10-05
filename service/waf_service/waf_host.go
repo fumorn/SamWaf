@@ -32,6 +32,18 @@ func normalizeIsEnableResponseBuffering(v int) int {
 	return 1
 }
 
+// checkCaptchaPassBindingSSL 是验证码配置的跨字段校验：passBinding="ip+tls" 会把
+// 通行凭证绑定到请求的 TLS 指纹，而站点不启用 SSL（Ssl!=1）时请求永远没有指纹，
+// 凭证一张都签发不出来——站点会被自己的验证码配置锁死。保存期在这里明确拒绝，
+// 让管理员先启用 SSL 再绑定；引擎侧（IssuePass/HasPass）对无指纹请求同样 fail closed
+// 双保险。传统点选引擎与 capJs 共用 IssuePass，此约束对两种引擎同样生效。
+func checkCaptchaPassBindingSSL(captchaJSON string, ssl int) error {
+	if ssl != 1 && model.ParseCaptchaConfig(captchaJSON).PassBinding == model.CaptchaPassBindingIPTLS {
+		return errors.New("TLS 指纹绑定需要站点启用 SSL")
+	}
+	return nil
+}
+
 func (receiver *WafHostService) AddApi(wafHostAddReq request.WafHostAddReq) (string, error) {
 	uniCode := ""
 	if wafHostAddReq.Code == "" {
@@ -46,19 +58,14 @@ func (receiver *WafHostService) AddApi(wafHostAddReq request.WafHostAddReq) (str
 		httpAuthPathPrefix = utils.GenerateRandomPathPrefix()
 	}
 
-	// 处理验证码配置JSON，如果没有设置路径前缀，则生成随机前缀
-	captchaJSON := wafHostAddReq.CaptchaJSON
-	if captchaJSON != "" {
-		var captchaConfig model.CaptchaConfig
-		err := json.Unmarshal([]byte(captchaJSON), &captchaConfig)
-		if err == nil && captchaConfig.PathPrefix == "" {
-			captchaConfig.PathPrefix = utils.GenerateRandomPathPrefix()
-			// 重新序列化
-			updatedJSON, err := json.Marshal(captchaConfig)
-			if err == nil {
-				captchaJSON = string(updatedJSON)
-			}
-		}
+	// 先完整默认解码并校验，拒绝坏类型/未知字段，不能把零值结构重新写回库。
+	captchaJSON, err := model.NormalizeCaptchaJSON(wafHostAddReq.CaptchaJSON, utils.GenerateRandomPathPrefix())
+	if err != nil {
+		return "", err
+	}
+	// 跨字段校验必须在任何数据库写入前完成（passBinding="ip+tls" 需要站点启用 SSL）。
+	if err := checkCaptchaPassBindingSSL(captchaJSON, wafHostAddReq.Ssl); err != nil {
+		return "", err
 	}
 
 	var wafHost = &model.Hosts{
@@ -141,6 +148,11 @@ func (receiver *WafHostService) CheckIsExist(host string, port string) error {
 }
 
 func (receiver *WafHostService) ModifyApi(wafHostEditReq request.WafHostEditReq) error {
+	// 与新增共用严格校验，错误必须在任何数据库写入前返回给管理端。
+	captchaJSON, captchaErr := model.NormalizeCaptchaJSON(wafHostEditReq.CaptchaJSON)
+	if captchaErr != nil {
+		return captchaErr
+	}
 	var webHost model.Hosts
 	global.GWAF_LOCAL_DB.Where("host = ? and port= ?", wafHostEditReq.Host, wafHostEditReq.Port).Find(&webHost)
 	if webHost.Id != "" && webHost.Code != wafHostEditReq.CODE {
@@ -153,6 +165,19 @@ func (receiver *WafHostService) ModifyApi(wafHostEditReq request.WafHostEditReq)
 	// 只是更隐蔽。这里只拦「改之前托管着认证中心、改之后不再托管」这一种情况，
 	// 认证中心站点的其它字段（后端地址、证书……）照常可改。
 	oldHost := receiver.GetDetailByCodeApi(wafHostEditReq.CODE)
+	// 旧客户端没有提交路径时沿用原前缀；只有从未设置时才生成，根路径不变。
+	captchaPrefix := model.ParseCaptchaConfig(oldHost.CaptchaJSON).PathPrefix
+	if captchaPrefix == "" {
+		captchaPrefix = utils.GenerateRandomPathPrefix()
+	}
+	captchaJSON, captchaErr = model.NormalizeCaptchaJSON(captchaJSON, captchaPrefix)
+	if captchaErr != nil {
+		return captchaErr
+	}
+	// 跨字段校验同样必须先于任何数据库写入（编辑也会把 Ssl 改成 0 或把绑定改成 ip+tls）。
+	if err := checkCaptchaPassBindingSSL(captchaJSON, wafHostEditReq.Ssl); err != nil {
+		return err
+	}
 	if used, centerHost := WafAccessConfigServiceApp.IsHostUsedAsCenter(oldHost); used {
 		after := model.Hosts{Host: wafHostEditReq.Host, BindMoreHost: wafHostEditReq.BindMoreHost}
 		if stillUsed, _ := WafAccessConfigServiceApp.IsHostUsedAsCenter(after); !stillUsed {
@@ -195,7 +220,7 @@ func (receiver *WafHostService) ModifyApi(wafHostEditReq request.WafHostEditReq)
 		"ResponseTimeOut":           wafHostEditReq.ResponseTimeOut,
 		"HealthyJSON":               wafHostEditReq.HealthyJSON,
 		"InsecureSkipVerify":        wafHostEditReq.InsecureSkipVerify,
-		"CaptchaJSON":               wafHostEditReq.CaptchaJSON,
+		"CaptchaJSON":               captchaJSON,
 		"AntiLeechJSON":             wafHostEditReq.AntiLeechJSON,
 		"CacheJSON":                 wafHostEditReq.CacheJSON,
 		"StaticSiteJSON":            wafHostEditReq.StaticSiteJSON,
