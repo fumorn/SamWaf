@@ -6,7 +6,6 @@ package wafenginecore
 //   - TestCheckDenyIP_GlobalHostMissing_ShouldNotPanic 是 nil 解引用的回归，修复前会 panic。
 
 import (
-	"SamWaf/common/zlog"
 	"SamWaf/global"
 	"SamWaf/innerbean"
 	"SamWaf/model"
@@ -18,7 +17,6 @@ import (
 // newDenyIPTestEngine 造一个只含路由快照的引擎；global 为 true 时登记全局网站（GUARD_STATUS=0，不参与判定）。
 func newDenyIPTestEngine(t *testing.T, withGlobalHost bool) *WafEngine {
 	t.Helper()
-	zlog.InitZLog(global.GWAF_LOG_DEBUG_ENABLE, "json")
 
 	oldGlobalName := global.GWAF_GLOBAL_HOST_NAME
 	global.GWAF_GLOBAL_HOST_NAME = "全局网站:0"

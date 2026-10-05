@@ -1,8 +1,6 @@
 package wafenginecore
 
 import (
-	"SamWaf/common/zlog"
-	"SamWaf/global"
 	"SamWaf/innerbean"
 	"SamWaf/wafproxy"
 	"context"
@@ -142,7 +140,6 @@ func newProxyHarness(t *testing.T, backendHandler http.HandlerFunc, transport *h
 // 后端 hang 住不返回，客户端建立连接后发送请求再 cancel context。
 // 期望：ReverseProxy.ErrorHandler 被触发，且类型为 client_canceled。
 func TestErrorResponse_ClientCanceled(t *testing.T) {
-	zlog.InitZLog(global.GWAF_LOG_DEBUG_ENABLE, "console")
 
 	backendStarted := make(chan struct{})
 	release := make(chan struct{})
@@ -191,7 +188,6 @@ func TestErrorResponse_ClientCanceled(t *testing.T) {
 // 把反向代理指向一个已关闭的监听端口。
 // 期望：category == backend_error，状态码 503。
 func TestErrorResponse_BackendRefused(t *testing.T) {
-	zlog.InitZLog(global.GWAF_LOG_DEBUG_ENABLE, "console")
 
 	// 先开 listener 再立刻关，拿到一个肯定没人监听的端口
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -233,7 +229,6 @@ func TestErrorResponse_BackendRefused(t *testing.T) {
 // TestErrorResponse_ResponseHeaderTimeout 通过 Transport.ResponseHeaderTimeout 让 RoundTrip
 // 在后端迟迟不返回响应头时超时，expected category == net_timeout。
 func TestErrorResponse_ResponseHeaderTimeout(t *testing.T) {
-	zlog.InitZLog(global.GWAF_LOG_DEBUG_ENABLE, "console")
 
 	done := make(chan struct{})
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

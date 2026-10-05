@@ -9,7 +9,6 @@ package wafenginecore
 // 「一次改动多站点同时生效」的语义会退化成需要逐站点下发，那时应当重新审视本文件的注释。
 
 import (
-	"SamWaf/common/zlog"
 	"SamWaf/global"
 	"SamWaf/innerbean"
 	"SamWaf/model"
@@ -23,7 +22,6 @@ import (
 // globalGuard 决定全局网站是否开启防护（关闭时全局名单不参与判定）。
 func newIPGroupTestEngine(t *testing.T, globalGuard int) *WafEngine {
 	t.Helper()
-	zlog.InitZLog(global.GWAF_LOG_DEBUG_ENABLE, "json")
 
 	oldGlobalName := global.GWAF_GLOBAL_HOST_NAME
 	global.GWAF_GLOBAL_HOST_NAME = "全局网站:0"

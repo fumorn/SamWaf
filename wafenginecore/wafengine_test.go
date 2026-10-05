@@ -20,6 +20,7 @@ import (
 	"testing"
 )
 
+// 日志由 acme_challenge_test.go 的 TestMain 统一初始化；并行测试不可重置全局日志器。
 func TestReplaceBodyContent(t *testing.T) {
 	// 测试用例表格
 	tests := []struct {
@@ -120,8 +121,6 @@ func TestReplaceBodyContent(t *testing.T) {
 func TestReplaceURLContent(t *testing.T) {
 	t.Parallel()
 
-	//初始化日志
-	zlog.InitZLog(global.GWAF_LOG_DEBUG_ENABLE, "json")
 	if v := recover(); v != nil {
 		zlog.Error("error")
 	}
@@ -156,8 +155,6 @@ func TestReplaceURLContent(t *testing.T) {
 func TestGetOrgContent(t *testing.T) {
 	t.Parallel()
 
-	//初始化日志
-	zlog.InitZLog(global.GWAF_LOG_DEBUG_ENABLE, "json")
 	// 初始化WAF引擎
 	waf := &WafEngine{}
 
@@ -326,8 +323,6 @@ func TestGetOrgContent(t *testing.T) {
 func TestGetOrgContentWithChunkedEncoding(t *testing.T) {
 	t.Parallel()
 
-	//初始化日志
-	zlog.InitZLog(global.GWAF_LOG_DEBUG_ENABLE, "json")
 	// 初始化WAF引擎
 	waf := &WafEngine{}
 
@@ -358,8 +353,6 @@ func TestGetOrgContentWithChunkedEncoding(t *testing.T) {
 func TestGetOrgContentWithEmptyBody(t *testing.T) {
 	t.Parallel()
 
-	//初始化日志
-	zlog.InitZLog(global.GWAF_LOG_DEBUG_ENABLE, "json")
 	// 初始化WAF引擎
 	waf := &WafEngine{}
 
@@ -390,8 +383,6 @@ func TestGetOrgContentWithEmptyBody(t *testing.T) {
 func TestGetOrgContentWithErrors(t *testing.T) {
 	t.Parallel()
 
-	//初始化日志
-	zlog.InitZLog(global.GWAF_LOG_DEBUG_ENABLE, "json")
 	// 初始化WAF引擎
 	waf := &WafEngine{}
 
@@ -418,7 +409,6 @@ func TestGetOrgContentWithErrors(t *testing.T) {
 
 func TestGetOrgContent_MetaAndDoctypeCharset(t *testing.T) {
 	t.Parallel()
-	zlog.InitZLog(global.GWAF_LOG_DEBUG_ENABLE, "json")
 	waf := &WafEngine{}
 
 	// 1. meta标签指定utf-8
@@ -950,7 +940,6 @@ func newEncodingTestResponse(contentType string, body []byte) *http.Response {
 // TestGetOrgContent_MultiCharsets 覆盖WHATWG各编码家族：Content-Type声明与meta声明两条命中路径
 func TestGetOrgContent_MultiCharsets(t *testing.T) {
 	t.Parallel()
-	zlog.InitZLog(global.GWAF_LOG_DEBUG_ENABLE, "json")
 	waf := &WafEngine{}
 
 	cases := []struct {
@@ -1054,7 +1043,6 @@ func TestGetOrgContent_MultiCharsets(t *testing.T) {
 // TestGetOrgContent_DefaultEncoding 站点"默认编码"配置的优先级与auto特判
 func TestGetOrgContent_DefaultEncoding(t *testing.T) {
 	t.Parallel()
-	zlog.InitZLog(global.GWAF_LOG_DEBUG_ENABLE, "json")
 	waf := &WafEngine{}
 
 	// 1. defaultEncoding=gbk 优先级最高：即使Content-Type谎报utf-8也按gbk解
@@ -1093,7 +1081,6 @@ func TestGetOrgContent_DefaultEncoding(t *testing.T) {
 // TestGetOrgContent_HeuristicDetection 无声明时的兜底检测链
 func TestGetOrgContent_HeuristicDetection(t *testing.T) {
 	t.Parallel()
-	zlog.InitZLog(global.GWAF_LOG_DEBUG_ENABLE, "json")
 	waf := &WafEngine{}
 
 	// 1. UTF-8中文内容、无任何charset声明（复现线上"编码检测不确定"WARN）
@@ -1176,7 +1163,6 @@ func TestGetOrgContent_HeuristicDetection(t *testing.T) {
 // TestContentEncoding_RoundTrip 检测+回写的无损往返：getOrgContent解出UTF-8后经compressContent还原为原始字节
 func TestContentEncoding_RoundTrip(t *testing.T) {
 	t.Parallel()
-	zlog.InitZLog(global.GWAF_LOG_DEBUG_ENABLE, "json")
 	waf := &WafEngine{}
 
 	cases := []struct {
