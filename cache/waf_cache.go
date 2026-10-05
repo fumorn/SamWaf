@@ -11,6 +11,10 @@ import (
 type WafCache struct {
 	cache map[string]WafCacheItem
 	mu    sync.Mutex
+	// Captcha capacity accounting shares mu with cache, including legacy mutations.
+	captchaIndex map[string]*captchaExpiry
+	captchaHeap  captchaExpiryHeap
+	captchaLimit int // zero uses DefaultCaptchaEntryLimit; private override for tests
 }
 type WafCacheItem struct {
 	value      interface{}
@@ -50,12 +54,12 @@ func (wafCache *WafCache) SetWithTTl(key string, value interface{}, ttl time.Dur
 	if found {
 		createTime = item.createTime
 	}
-	wafCache.cache[key] = WafCacheItem{
+	_ = wafCache.setItemLocked(key, WafCacheItem{
 		value:      value,
 		createTime: createTime,
 		expireTime: createTime.Add(ttl),
 		ttl:        ttl,
-	}
+	})
 }
 
 // SetWithTTlRenewTime 并重置时间
@@ -64,12 +68,12 @@ func (wafCache *WafCache) SetWithTTlRenewTime(key string, value interface{}, ttl
 	defer wafCache.mu.Unlock()
 	createTime := time.Now()
 
-	wafCache.cache[key] = WafCacheItem{
+	_ = wafCache.setItemLocked(key, WafCacheItem{
 		value:      value,
 		createTime: createTime,
 		expireTime: createTime.Add(ttl), // 计算过期时间
 		ttl:        ttl,
-	}
+	})
 }
 func (wafCache *WafCache) GetAs(key string, out interface{}) error {
 	val := wafCache.Get(key)
@@ -114,9 +118,10 @@ func (wafCache *WafCache) IsKeyExist(key string) bool {
 	if time.Since(item.createTime) <= item.ttl {
 		return true
 	}
-	delete(wafCache.cache, key)
+	wafCache.deleteItemLocked(key)
 	return false
 }
+
 // ExistsE 内存实现不会有后端故障，error 恒为 nil
 func (wafCache *WafCache) ExistsE(key string) (bool, error) {
 	return wafCache.IsKeyExist(key), nil
@@ -127,16 +132,20 @@ func (wafCache *WafCache) GetAsEx(key string, out interface{}, ttl time.Duration
 	wafCache.mu.Lock()
 	item, found := wafCache.cache[key]
 	if found && time.Since(item.createTime) > item.ttl {
-		delete(wafCache.cache, key)
+		wafCache.deleteItemLocked(key)
 		found = false
 	}
 	if found && ttl > 0 {
 		now := time.Now()
-		wafCache.cache[key] = WafCacheItem{
+		err := wafCache.setItemLocked(key, WafCacheItem{
 			value:      item.value,
 			createTime: now,
 			expireTime: now.Add(ttl),
 			ttl:        ttl,
+		})
+		if err != nil {
+			wafCache.mu.Unlock()
+			return err
 		}
 	}
 	wafCache.mu.Unlock()
@@ -160,17 +169,17 @@ func (wafCache *WafCache) Touch(key string, ttl time.Duration) error {
 		return ErrCacheMiss
 	}
 	if time.Since(item.createTime) > item.ttl {
-		delete(wafCache.cache, key)
+		wafCache.deleteItemLocked(key)
 		return ErrCacheMiss
 	}
 	if ttl > 0 {
 		now := time.Now()
-		wafCache.cache[key] = WafCacheItem{
+		return wafCache.setItemLocked(key, WafCacheItem{
 			value:      item.value,
 			createTime: now,
 			expireTime: now.Add(ttl),
 			ttl:        ttl,
-		}
+		})
 	}
 	return nil
 }
@@ -185,7 +194,7 @@ func (wafCache *WafCache) Get(key string) interface{} {
 	if time.Since(item.createTime) <= item.ttl {
 		return item.value
 	}
-	delete(wafCache.cache, key)
+	wafCache.deleteItemLocked(key)
 	return nil
 }
 
@@ -196,7 +205,7 @@ func (wafCache *WafCache) Remove(key string) interface{} {
 	if !found {
 		return nil
 	}
-	delete(wafCache.cache, key)
+	wafCache.deleteItemLocked(key)
 	return nil
 }
 func (wafCache *WafCache) GetExpireTime(key string) (time.Time, error) {
@@ -210,7 +219,7 @@ func (wafCache *WafCache) GetExpireTime(key string) (time.Time, error) {
 		return item.expireTime, nil
 	}
 	zlog.Debug("GetExpireTime CLEAR CACHE EXPIRE :" + key)
-	delete(wafCache.cache, key)
+	wafCache.deleteItemLocked(key)
 	return time.Time{}, ErrCacheMiss
 }
 func (wafCache *WafCache) ClearExpirationCache() {
@@ -220,7 +229,7 @@ func (wafCache *WafCache) ClearExpirationCache() {
 	for key, item := range wafCache.cache {
 		if now.Sub(item.createTime) > item.ttl {
 			zlog.Debug("ClearExpirationCache CLEAR CACHE EXPIRE :" + key)
-			delete(wafCache.cache, key)
+			wafCache.deleteItemLocked(key)
 		}
 	}
 }
@@ -244,7 +253,7 @@ func (wafCache *WafCache) ListAvailableKeys() map[string]time.Duration {
 		if remainingTime > 0 {
 			availableKeys[key] = remainingTime
 		} else {
-			delete(wafCache.cache, key) // 删除过期项
+			wafCache.deleteItemLocked(key) // 删除过期项
 		}
 	}
 	return availableKeys
@@ -263,7 +272,7 @@ func (wafCache *WafCache) ListAvailableKeysWithPrefix(prefix string) map[string]
 			if remainingTime > 0 {
 				availableKeys[key] = remainingTime
 			} else {
-				delete(wafCache.cache, key) // 删除过期项
+				wafCache.deleteItemLocked(key) // 删除过期项
 			}
 		}
 	}
