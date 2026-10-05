@@ -658,7 +658,17 @@ func (waf *WafEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 
 				// 验证码检测
-				captchaConfig := model.ParseCaptchaConfig(hostTarget.Host.CaptchaJSON)
+				captchaConfig, captchaErr := model.DecodeCaptchaConfig(hostTarget.Host.CaptchaJSON)
+				if captchaErr != nil {
+					http.Error(w, "Invalid CAPTCHA configuration", http.StatusServiceUnavailable)
+					return
+				}
+				// Dispatch only exact, engine-matched internal endpoints after all other
+				// WAF checks, even when a pass or CC grace already exists. Never exempt
+				// an arbitrary prefix from the detection chain or proxy it to the origin.
+				if waf.handleCaptchaEndpoint(w, r, &weblogbean, captchaConfig, hostTarget.Host.IPMode) {
+					return
+				}
 
 				// CC 规则的「人机验证」动作也从这里出闸：命中后该客户端被标记为需要验证，
 				// 于是即便站点没有常开验证码，也会走同一套挑战与放行凭证——
@@ -669,8 +679,8 @@ func (waf *WafEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					// 被 CC 规则要求验证的客户端带着有效凭证过来了，说明这一轮挑战已经完成：
 					// 把"需验证"换成同等长度的免挑战期。免挑战期一过再超阈值会重新挑战，
 					// 所以这个动作是可重复的关卡。
-					if ccNeedCaptcha && hasCaptchaPass(r, ccCaptchaIP) {
-						GrantCCCaptchaGrace(hostTarget.Host.Code, ccCaptchaIP)
+					if ccNeedCaptcha && hasCaptchaPass(r, hostTarget.Host.Code, ccCaptchaIP, captchaConfig) {
+						GrantCCCaptchaGrace(hostTarget.Host.Code, ccCaptchaIP, captchaConfig)
 					}
 					if !waf.checkCaptchaToken(r, weblogbean, captchaConfig, hostTarget.Host.IPMode) {
 						// 检查当前URL是否在排除列表中
@@ -681,12 +691,6 @@ func (waf *WafEngine) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						captchaPathPrefix := captchaConfig.PathPrefix
 						if captchaPathPrefix == "" {
 							captchaPathPrefix = "/samwaf_captcha"
-						}
-
-						// 检查是否是验证码相关路径，如果是则直接处理
-						if strings.HasPrefix(currentURL, captchaPathPrefix+"/") || currentURL == captchaPathPrefix {
-							waf.handleCaptchaRequest(w, r, &weblogbean, captchaConfig, captchaPathPrefix, hostTarget.Host.IPMode)
-							return
 						}
 
 						if len(captchaConfig.ExcludeURLs) > 0 {
@@ -1723,6 +1727,9 @@ func (waf *WafEngine) StartProxyServer(innruntime innerbean.ServerRunTime) {
 					Server: &http.Server{
 						Addr:    ":" + portStr,
 						Handler: waf.altSvcHandler(h3Holder, portStr),
+						// 指纹采集：ConnContext 从采集连接提取 JA3+ALPN 放入请求上下文，
+						// 供人机验证通行凭证的 TLS 指纹绑定消费（passBinding="ip+tls"）。
+						ConnContext: wafhttpserver.ConnContext,
 						TLSConfig: &tls.Config{
 							GetCertificate: waf.GetCertificateFunc,
 							MinVersion:     utils.ParseTLSVersion(global.GCONFIG_RECORD_SSLMinVerson),
@@ -1736,7 +1743,8 @@ func (waf *WafEngine) StartProxyServer(innruntime innerbean.ServerRunTime) {
 					Addr: ":" + portStr,
 					// 固定安装 Alt-Svc 包装处理器：内部按 h3Holder 是否活跃决定要不要加 Alt-Svc，
 					// 这样 http3 开关热生效时无需在运行期改写 Handler(会与在途请求竞态)。
-					Handler: waf.altSvcHandler(h3Holder, portStr),
+					Handler:     waf.altSvcHandler(h3Holder, portStr),
+					ConnContext: wafhttpserver.ConnContext,
 					TLSConfig: &tls.Config{
 						GetCertificate: waf.GetCertificateFunc,
 						// 按 SNI 逐连接定制 ALPN，实现 per-host 的对外 HTTP/2 开关：
@@ -1785,7 +1793,8 @@ func (waf *WafEngine) StartProxyServer(innruntime innerbean.ServerRunTime) {
 				if global.GCONFIG_ENABLE_PROXY_PROTOCOL == 1 {
 					ln = &proxyproto.Listener{Listener: ln}
 				}
-				err = svr.ServeTLS(ln, "", "")
+				// 指纹采集监听器包在最外层（proxyproto 解包后再窥探 ClientHello）。
+				err = svr.ServeTLS(wafhttpserver.FingerprintListener(ln), "", "")
 				if err == http.ErrServerClosed {
 					zlog.Error("[HTTPServer] https server has been close, cause:[%v]", err)
 				} else {

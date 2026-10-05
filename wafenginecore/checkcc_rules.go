@@ -3,7 +3,6 @@ package wafenginecore
 import (
 	"SamWaf/common/diagstat"
 	"SamWaf/common/zlog"
-	"SamWaf/enums"
 	"SamWaf/global"
 	"SamWaf/innerbean"
 	"SamWaf/model"
@@ -12,6 +11,7 @@ import (
 	"SamWaf/wafenginecore/cccounter"
 	"SamWaf/wafenginecore/ccrule"
 	"SamWaf/wafenginecore/ccstats"
+	"SamWaf/wafenginecore/wafcaptcha"
 	"net/http"
 	"time"
 )
@@ -172,12 +172,16 @@ func (waf *WafEngine) applyCCAction(
 		if captchaIP == "" {
 			captchaIP = clientIP
 		}
+		cfg, err := model.DecodeCaptchaConfig(hostTarget.Host.CaptchaJSON)
+		if err != nil {
+			return detection.Result{IsBlock: true, Title: title, Content: "验证码配置无效"}, true
+		}
 		// 免挑战期内不重复挑战：验证通过后计数窗口不会立刻清零，
 		// 不给这段缓冲的话，通过验证的访客下一个请求就会被再次挑战，陷入死循环。
 		//
 		// 文案必须与「本次要求验证」区分开：两条路径都不阻断本次请求，
 		// 日志上分不开的话，看到「人机验证」却没弹出挑战，只能理解成功能坏了。
-		if isCCCaptchaInGrace(hostTarget.Host.Code, captchaIP) {
+		if isCCCaptchaInGrace(hostTarget.Host.Code, captchaIP, cfg) {
 			weblogbean.RULE = "CC人机验证-免挑战期内放行:" + label
 			return detection.Result{}, true
 		}
@@ -186,16 +190,23 @@ func (waf *WafEngine) applyCCAction(
 		// 这一步不能留给后面的验证码闸门做。闸门发放免挑战期的条件是「访客带着有效凭证出现」，
 		// 而 CC 检测跑在闸门之前，下面那行作废会把凭证删掉，闸门于是永远看不到它——
 		// 结果是访客每完成一次挑战、下一个请求又被挑战，直到计数窗口自己漏空。
-		if IsCCCaptchaRequired(hostTarget.Host.Code, captchaIP) && hasCaptchaPass(r, captchaIP) {
-			GrantCCCaptchaGrace(hostTarget.Host.Code, captchaIP)
+		if IsCCCaptchaRequired(hostTarget.Host.Code, captchaIP) && hasCaptchaPass(r, hostTarget.Host.Code, captchaIP, cfg) {
+			GrantCCCaptchaGrace(hostTarget.Host.Code, captchaIP, cfg)
 			weblogbean.RULE = "CC人机验证-本轮已通过:" + label
 			return detection.Result{}, true
 		}
 		// 撤销当前持有的通行凭证。站点级凭证的有效期以小时计（默认 24 小时），
 		// 沿用它意味着这个动作只是一次性关卡：过一次之后在凭证有效期内再怎么超量都不会被要求验证。
 		weblogbean.RULE = "CC人机验证:" + label
-		revokeCaptchaPass(r, captchaIP)
+		if err := revokeCaptchaPass(r, hostTarget.Host.Code, captchaIP, cfg); err != nil {
+			return detection.Result{IsBlock: true, Title: title, Content: "验证码服务暂不可用"}, true
+		}
 		RequireCaptcha(hostTarget.Host.Code, captchaIP, rule.ActionSeconds, "CC规则 "+label)
+		// The legacy marker API cannot report write errors. Do not silently
+		// continue to an otherwise disabled CAPTCHA gate if the marker was lost.
+		if !IsCCCaptchaRequired(hostTarget.Host.Code, captchaIP) {
+			return detection.Result{IsBlock: true, Title: title, Content: "验证码服务暂不可用"}, true
+		}
 		return detection.Result{}, true
 
 	case model.CCActionBan:
@@ -264,23 +275,26 @@ func CaptchaRequireSource(hostCode, clientIP string) string {
 	return ""
 }
 
-func ccCaptchaGraceKey(hostCode, clientIP string) string {
-	return "CACHE_CC_CAPTCHA_GRACE_" + hostCode + "|" + clientIP
+func ccCaptchaGraceKey(hostCode, clientIP string, cfg model.CaptchaConfig) string {
+	if scope := wafcaptcha.Scope(hostCode, clientIP, cfg); scope != "" {
+		return "CACHE_CC_CAPTCHA_GRACE_v2:" + scope
+	}
+	return ""
 }
 
 // isCCCaptchaInGrace 该客户端是否处于「刚通过验证」的免挑战期。
-func isCCCaptchaInGrace(hostCode, clientIP string) bool {
-	if global.GCACHE_WAFCACHE == nil || clientIP == "" {
+func isCCCaptchaInGrace(hostCode, clientIP string, cfg model.CaptchaConfig) bool {
+	if global.GCACHE_WAFCACHE == nil || ccCaptchaGraceKey(hostCode, clientIP, cfg) == "" {
 		return false
 	}
-	return global.GCACHE_WAFCACHE.IsKeyExist(ccCaptchaGraceKey(hostCode, clientIP))
+	return global.GCACHE_WAFCACHE.IsKeyExist(ccCaptchaGraceKey(hostCode, clientIP, cfg))
 }
 
 // GrantCCCaptchaGrace 客户端带着有效凭证出现在闸门前，说明这一轮验证已经通过：
 // 清掉「需验证」标记，换成同等长度的免挑战期。免挑战期结束后再超阈值会重新挑战，
 // 因此这个动作是可重复的关卡，不是一次性的。
-func GrantCCCaptchaGrace(hostCode, clientIP string) {
-	if global.GCACHE_WAFCACHE == nil || clientIP == "" {
+func GrantCCCaptchaGrace(hostCode, clientIP string, cfg model.CaptchaConfig) {
+	if global.GCACHE_WAFCACHE == nil || ccCaptchaGraceKey(hostCode, clientIP, cfg) == "" {
 		return
 	}
 	seconds := ccCaptchaDefaultSeconds
@@ -290,20 +304,12 @@ func GrantCCCaptchaGrace(hostCode, clientIP string) {
 	global.GCACHE_WAFCACHE.Remove(ccCaptchaRequiredKey(hostCode, clientIP))
 	global.GCACHE_WAFCACHE.Remove(ccCaptchaSourceKey(hostCode, clientIP))
 	global.GCACHE_WAFCACHE.SetWithTTl(
-		ccCaptchaGraceKey(hostCode, clientIP), 1, time.Duration(seconds)*time.Second)
+		ccCaptchaGraceKey(hostCode, clientIP, cfg), 1, time.Duration(seconds)*time.Second)
 }
 
 // revokeCaptchaPass 作废该客户端当前持有的验证码通行凭证，使其必须重新完成挑战。
-func revokeCaptchaPass(r *http.Request, clientIP string) {
-	if global.GCACHE_WAFCACHE == nil || r == nil || clientIP == "" {
-		return
-	}
-	if cookie, err := r.Cookie("samwaf_captcha_token"); err == nil && cookie.Value != "" {
-		global.GCACHE_WAFCACHE.Remove(enums.CACHE_CAPTCHA_PASS + cookie.Value + clientIP)
-	}
-	if token := r.Header.Get("X-SamWaf-Captcha-Token"); token != "" {
-		global.GCACHE_WAFCACHE.Remove(enums.CACHE_CAPTCHA_PASS + token + clientIP)
-	}
+func revokeCaptchaPass(r *http.Request, hostCode, clientIP string, cfg model.CaptchaConfig) error {
+	return wafcaptcha.RevokePass(global.GCACHE_WAFCACHE, r, hostCode, clientIP, cfg)
 }
 
 func ccCaptchaRequiredKey(hostCode, clientIP string) string {
