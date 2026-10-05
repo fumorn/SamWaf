@@ -40,3 +40,11 @@ dist/
 # go test 各包时按包目录创建的日志导出跨进程锁文件（每包一份，互不争用）
 **/data/.samwaf_log_lifecycle.lock
 **/data/.samwaf_log_export_executor.lock
+# Independent management frontend development checkout (its own Git history).
+/web-dev/
+
+# Local development workspace file (references the uncommitted library checkout).
+/go.work
+
+# Local penetration-test lab: entirely developer-local, never part of the product.
+/pentest-lab/
