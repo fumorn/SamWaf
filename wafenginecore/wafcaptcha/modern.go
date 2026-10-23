@@ -242,12 +242,33 @@ func (s *CaptchaService) handleModernCaptcha(w http.ResponseWriter, r *http.Requ
 		}
 		return
 	}
+	// 与上游旧 capJs 分支同一套按 IP 限频：取题类 60/分、交卷类 30/分。
+	// v2 路由是本分支新增的，合并上游限频时必须在这里同样接上，
+	// 否则新引擎等于绕过了限频这道减速带。
+	limiterIP := ""
+	if log != nil {
+		limiterIP = model.GetClientIPByMode(ipMode, log.NetSrcIp, log.SRC_IP)
+	}
+	limiterIP = requestLimiterIP(r, limiterIP)
+
 	switch r.URL.Path {
 	case prefix + "/v2/challenge":
+		if !s.allowCaptchaRequest(rateActionChallenge, limiterIP, captchaRateIssueLimit) {
+			writeCaptchaRateLimited(w)
+			return
+		}
 		s.GetCapJsChallenge(w, r, cfg, log, ipMode)
 	case prefix + "/v2/redeem":
+		if !s.allowCaptchaRequest(rateActionRedeem, limiterIP, captchaRateCheckLimit) {
+			writeCaptchaRateLimited(w)
+			return
+		}
 		s.VerifyCapJsCaptcha(w, r, cfg, log, ipMode)
 	case prefix + "/v2/validate":
+		if !s.allowCaptchaRequest(rateActionValidate, limiterIP, captchaRateCheckLimit) {
+			writeCaptchaRateLimited(w)
+			return
+		}
 		s.ValidateCapJsCaptcha(w, r, cfg, log, ipMode)
 	case prefix + "/challenge", prefix + "/redeem", prefix + "/validate":
 		w, trace := beginModernTrace(w, r, cfg, log, ipMode, strings.TrimPrefix(r.URL.Path, prefix+"/"))
