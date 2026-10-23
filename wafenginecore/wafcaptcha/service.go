@@ -503,7 +503,7 @@ func (s *CaptchaService) VerifyCaptcha(w http.ResponseWriter, r *http.Request, c
 			"code":    code,
 			"message": "behavior check failed",
 		})
-		_, _ = fmt.Fprintf(w, string(bt))
+		_, _ = w.Write(bt)
 		return
 	}
 
