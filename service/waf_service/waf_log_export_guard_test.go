@@ -338,6 +338,27 @@ func TestLogExportGuardStartStop(t *testing.T) {
 	}
 	stopped := make(chan struct{})
 	go func() { s.Stop(); close(stopped) }()
+	// Stop 在另一个 goroutine 里执行：必须先等它真正把 stopping 置位，
+	// 否则这里的第一轮 Create 会赶在 Stop 拿到锁之前通过，
+	// 失败的是测试的时序假设而不是被检验的语义。
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		s.mu.Lock()
+		stopping := s.stopping
+		s.mu.Unlock()
+		if stopping {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("executor did not enter stopping state")
+		}
+		select {
+		case <-stopped:
+			return
+		default:
+		}
+		time.Sleep(time.Millisecond)
+	}
 	for i := 0; i < 50; i++ {
 		if _, err := s.Create(context.Background(), owner, exportGuardReq()); err == nil {
 			t.Fatal("create accepted while executor is stopping")
