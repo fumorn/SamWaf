@@ -561,6 +561,12 @@ func (s *WafLogExportService) Stop() {
 }
 func (s *WafLogExportService) loop(ctx context.Context, done chan struct{}) {
 	defer close(done)
+	// 数据库不可用时后台循环必须直接退出：Start 只在拿到执行器锁后才启动本 goroutine，
+	// 但测试或早期启动阶段本地库可能尚未初始化，此前这里的首次访问是裸解引用，
+	// 会以 SIGSEGV 打崩整个进程（而不是留下一条可读的错误）。
+	if global.GWAF_LOCAL_DB == nil {
+		return
+	}
 	now := time.Now()
 	global.GWAF_LOCAL_DB.Model(&model.LogExportTask{}).Where("status IN ?", []string{"running", "packaging", "cancelling"}).Updates(map[string]interface{}{"status": "failed", "phase": "complete", "error_code": "EXPORT_INTERRUPTED", "error_message": "执行器已重启，请重新导出", "finished_at": now})
 	s.reap()
@@ -582,6 +588,9 @@ func (s *WafLogExportService) loop(ctx context.Context, done chan struct{}) {
 	}
 }
 func (s *WafLogExportService) runNext(ctx context.Context) bool {
+	if global.GWAF_LOCAL_DB == nil {
+		return false
+	}
 	var t model.LogExportTask
 	if e := global.GWAF_LOCAL_DB.WithContext(ctx).Where("status = ?", "queued").Order("created_at asc").First(&t).Error; e != nil {
 		return false
@@ -637,6 +646,9 @@ func exportServerName() string {
 }
 
 func (s *WafLogExportService) finish(t model.LogExportTask, status, code, message string) {
+	if global.GWAF_LOCAL_DB == nil {
+		return
+	}
 	now := time.Now()
 	global.GWAF_LOCAL_DB.Model(&model.LogExportTask{}).Where("id = ? AND status IN ?", t.Id, exportActiveStates).Updates(map[string]interface{}{"status": status, "phase": "complete", "error_code": code, "error_message": message, "finished_at": now})
 	s.audit(LogExportActor{}, t, status, status == "ready")
@@ -843,6 +855,9 @@ func (s *WafLogExportService) sources(ctx context.Context, tenant string, lo, hi
 func (s *WafLogExportService) reap() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if global.GWAF_LOCAL_DB == nil {
+		return
+	}
 	now := time.Now()
 	var rows []model.LogExportTask
 	if global.GWAF_LOCAL_DB.Where("status NOT IN ?", exportActiveStates).Find(&rows).Error != nil {
